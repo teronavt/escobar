@@ -1,0 +1,132 @@
+name: CI and Ubuntu DEB releases
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+    tags:
+      - 'v[0-9]*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Go tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Test (monkey-patching requires disabled inlining)
+        run: go test -gcflags=-l ./...
+      - name: Build validation
+        run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o /tmp/escobar-check ./cmd/escobar
+
+  compile:
+    name: Build static Linux amd64 executable
+    needs: test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Compile
+        run: |
+          mkdir -p build
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+            go build -trimpath -ldflags='-s -w' -o build/escobar ./cmd/escobar
+          file build/escobar
+      - uses: actions/upload-artifact@v4
+        with:
+          name: escobar-linux-amd64
+          path: build/escobar
+          if-no-files-found: error
+          retention-days: 7
+
+  deb:
+    name: DEB Ubuntu ${{ matrix.ubuntu }} amd64
+    needs: compile
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        ubuntu: ['24.04', '26.04', '26.10']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: escobar-linux-amd64
+          path: build
+      - name: Set package version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="0.0.0+git$(git rev-parse --short=10 HEAD)"
+          fi
+          echo "PACKAGE_VERSION=$version" >> "$GITHUB_ENV"
+      - name: Package and smoke-test inside target Ubuntu image
+        env:
+          UBUNTU_VERSION: ${{ matrix.ubuntu }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x build/escobar
+          docker run --rm --platform linux/amd64 \
+            -v "$GITHUB_WORKSPACE:/src" -w /src \
+            -e PACKAGE_VERSION -e UBUNTU_VERSION \
+            "ubuntu:${UBUNTU_VERSION}" bash -euo pipefail -c '
+              apt-get update -qq
+              DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends dpkg-dev
+              bash packaging/build-deb.sh "$PACKAGE_VERSION" "$UBUNTU_VERSION" amd64
+              deb="$(find dist -maxdepth 1 -name "*.deb" -type f -print -quit)"
+              test -n "$deb"
+              dpkg-deb --info "$deb"
+              dpkg -i "$deb"
+              test -x /usr/bin/escobar
+              test -f /usr/lib/systemd/system/escobar@.service
+              /usr/bin/escobar --version
+            '
+      - uses: actions/upload-artifact@v4
+        with:
+          name: escobar-deb-ubuntu-${{ matrix.ubuntu }}-amd64
+          path: dist/*.deb
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: deb
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: escobar-deb-ubuntu-*-amd64
+          path: release
+          merge-multiple: true
+      - name: Check releases and generate SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release
+          test "$(find . -maxdepth 1 -name '*.deb' | wc -l)" -eq 3
+          sha256sum -- *.deb > SHA256SUMS
+          cat SHA256SUMS
+      - name: Publish release
+        uses: softprops/action-gh-release@v3
+        with:
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            release/*.deb
+            release/SHA256SUMS

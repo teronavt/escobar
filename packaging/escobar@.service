@@ -1,0 +1,19 @@
+[Unit]
+Description=Escobar local authenticated proxy (user %i)
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=%i
+EnvironmentFile=/etc/default/escobar-%i
+ExecStart=/usr/bin/escobar
+Restart=on-failure
+RestartSec=20s
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target
