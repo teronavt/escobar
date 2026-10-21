@@ -1,3 +1,7 @@
+Unreleased
+    *) Bugfix: HTTPS CONNECT authentication now handles 407 responses with an HTML body and Connection: close.
+    *) Change: HTTPS CONNECT sends configured downstream-proxy credentials preemptively.
+
 Changes with Escobar 3.0.0, 29 March 2022
     *) Feature: service support (Windows tested, Unix and macOS should work too)
     *) Feature: auto mode support for Linux (macOS not supported yet)

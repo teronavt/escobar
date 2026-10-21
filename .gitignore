@@ -9,3 +9,5 @@ configs/personal.env
 /dist/
 escobar
 escobar.exe
+
+vendor/

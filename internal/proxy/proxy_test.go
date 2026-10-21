@@ -5,14 +5,18 @@
 package proxy
 
 import (
+	"bufio"
 	"context"
 	"crypto/subtle"
 	"crypto/tls"
+	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -182,4 +186,284 @@ func TestProxy_CheckAuth(t *testing.T) {
 	})
 
 	require.NoError(t, p.Shutdown(context.Background()))
+}
+
+const testProxyAuthorization = "Basic dGVzdF91c2VyOnRlc3RfcGFzc3dvcmQ="
+
+func TestProxy_HTTPSConnectPreemptiveAuthorization(t *testing.T) {
+	downstream := listenConnectTestProxy(t)
+	done := make(chan error, 1)
+	var connectionCount int32
+
+	go func() {
+		pconn, err := downstream.Accept()
+		if err != nil {
+			done <- err
+			return
+		}
+		defer pconn.Close()
+		atomic.AddInt32(&connectionCount, 1)
+
+		br := bufio.NewReader(pconn)
+		if err := expectConnectRequest(br); err != nil {
+			done <- err
+			return
+		}
+		if _, err := io.WriteString(pconn, "HTTP/1.1 200 Connection established\r\n\r\n"); err != nil {
+			done <- err
+			return
+		}
+
+		buf := make([]byte, 4)
+		if _, err := io.ReadFull(br, buf); err != nil {
+			done <- err
+			return
+		}
+		if string(buf) != "ping" {
+			done <- fmt.Errorf("tunnel payload = %q, want ping", buf)
+			return
+		}
+		_, err = io.WriteString(pconn, "pong")
+		done <- err
+	}()
+
+	client, clientReader, resp := openConnectClient(t, downstream.Addr().String())
+	defer client.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	_, err := io.WriteString(client, "ping")
+	require.NoError(t, err)
+	pong := make([]byte, 4)
+	_, err = io.ReadFull(clientReader, pong)
+	require.NoError(t, err)
+	require.Equal(t, "pong", string(pong))
+	require.Equal(t, int32(1), atomic.LoadInt32(&connectionCount))
+	requireConnectTestDone(t, done)
+}
+
+func TestProxy_HTTPSConnectDrainsKeepAlive407(t *testing.T) {
+	downstream := listenConnectTestProxy(t)
+	done := make(chan error, 1)
+	var connectionCount int32
+
+	go func() {
+		pconn, err := downstream.Accept()
+		if err != nil {
+			done <- err
+			return
+		}
+		defer pconn.Close()
+		atomic.AddInt32(&connectionCount, 1)
+
+		br := bufio.NewReader(pconn)
+		if err := expectConnectRequest(br); err != nil {
+			done <- err
+			return
+		}
+		body := "<html>proxy authentication required</html>"
+		if _, err := fmt.Fprintf(pconn, "HTTP/1.1 407 Proxy Authentication Required\r\nContent-Type: text/html\r\nContent-Length: %d\r\nProxy-Authenticate: Negotiate\r\nConnection: keep-alive\r\n\r\n%s", len(body), body); err != nil {
+			done <- err
+			return
+		}
+		if err := expectConnectRequest(br); err != nil {
+			done <- err
+			return
+		}
+		_, err = io.WriteString(pconn, "HTTP/1.1 200 Connection established\r\n\r\n")
+		done <- err
+	}()
+
+	client, _, resp := openConnectClient(t, downstream.Addr().String())
+	defer client.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, int32(1), atomic.LoadInt32(&connectionCount))
+	requireConnectTestDone(t, done)
+}
+
+func TestProxy_HTTPSConnectReconnectsAfterClosing407(t *testing.T) {
+	downstream := listenConnectTestProxy(t)
+	done := make(chan error, 1)
+	var connectionCount int32
+
+	go func() {
+		pconn, err := downstream.Accept()
+		if err != nil {
+			done <- err
+			return
+		}
+		atomic.AddInt32(&connectionCount, 1)
+		br := bufio.NewReader(pconn)
+		if err := expectConnectRequest(br); err != nil {
+			pconn.Close()
+			done <- err
+			return
+		}
+		body := "<html>proxy authentication required</html>"
+		if _, err := fmt.Fprintf(pconn, "HTTP/1.1 407 Proxy Authentication Required\r\nContent-Type: text/html\r\nContent-Length: %d\r\nProxy-Authenticate: Negotiate\r\nConnection: close\r\n\r\n%s", len(body), body); err != nil {
+			pconn.Close()
+			done <- err
+			return
+		}
+		pconn.Close()
+
+		pconn, err = downstream.Accept()
+		if err != nil {
+			done <- err
+			return
+		}
+		defer pconn.Close()
+		atomic.AddInt32(&connectionCount, 1)
+		if err := expectConnectRequest(bufio.NewReader(pconn)); err != nil {
+			done <- err
+			return
+		}
+		_, err = io.WriteString(pconn, "HTTP/1.1 200 Connection established\r\n\r\n")
+		done <- err
+	}()
+
+	client, _, resp := openConnectClient(t, downstream.Addr().String())
+	defer client.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, int32(2), atomic.LoadInt32(&connectionCount))
+	requireConnectTestDone(t, done)
+}
+
+func TestProxy_HTTPSConnectStopsAfterAuthenticated407(t *testing.T) {
+	downstream := listenConnectTestProxy(t)
+	done := make(chan error, 1)
+	var connectionCount int32
+
+	go func() {
+		for i := 0; i < 2; i++ {
+			pconn, err := downstream.Accept()
+			if err != nil {
+				done <- err
+				return
+			}
+			atomic.AddInt32(&connectionCount, 1)
+			if err := expectConnectRequest(bufio.NewReader(pconn)); err != nil {
+				pconn.Close()
+				done <- err
+				return
+			}
+			if _, err := io.WriteString(pconn, "HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"); err != nil {
+				pconn.Close()
+				done <- err
+				return
+			}
+			pconn.Close()
+		}
+		done <- nil
+	}()
+
+	client, _, resp := openConnectClient(t, downstream.Addr().String())
+	defer client.Close()
+	require.Equal(t, http.StatusBadGateway, resp.StatusCode)
+	requireConnectTestDone(t, done)
+	require.Equal(t, int32(2), atomic.LoadInt32(&connectionCount))
+}
+
+func TestProxy_HTTPSConnectRejectsUnexpectedResponse(t *testing.T) {
+	downstream := listenConnectTestProxy(t)
+	done := make(chan error, 1)
+	var connectionCount int32
+
+	go func() {
+		pconn, err := downstream.Accept()
+		if err != nil {
+			done <- err
+			return
+		}
+		defer pconn.Close()
+		atomic.AddInt32(&connectionCount, 1)
+		if err := expectConnectRequest(bufio.NewReader(pconn)); err != nil {
+			done <- err
+			return
+		}
+		_, err = io.WriteString(pconn, "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+		done <- err
+	}()
+
+	client, _, resp := openConnectClient(t, downstream.Addr().String())
+	defer client.Close()
+	require.Equal(t, http.StatusBadGateway, resp.StatusCode)
+	requireConnectTestDone(t, done)
+	require.Equal(t, int32(1), atomic.LoadInt32(&connectionCount))
+}
+
+func listenConnectTestProxy(t *testing.T) net.Listener {
+	t.Helper()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = listener.Close() })
+	return listener
+}
+
+func openConnectClient(t *testing.T, downstreamAddress string) (net.Conn, *bufio.Reader, *http.Response) {
+	t.Helper()
+
+	proxyAddress := startConnectProxy(t, downstreamAddress)
+	client, err := net.Dial("tcp", proxyAddress)
+	require.NoError(t, err)
+	_, err = fmt.Fprint(client, "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\nProxy-Authorization: Basic YXR0YWNrZXI6Y3JlZGVudGlhbA==\r\n\r\n")
+	require.NoError(t, err)
+
+	reader := bufio.NewReader(client)
+	resp, err := http.ReadResponse(reader, &http.Request{Method: http.MethodConnect})
+	require.NoError(t, err)
+	return client, reader, resp
+}
+
+func startConnectProxy(t *testing.T, downstreamAddress string) string {
+	t.Helper()
+
+	downstreamURL, err := url.Parse("http://" + downstreamAddress)
+	require.NoError(t, err)
+	p := NewProxy(zap.NewNop(), &Config{
+		Addr:               &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0},
+		DownstreamProxyURL: downstreamURL,
+		DownstreamProxyAuth: DownstreamProxyAuth{
+			User:     "test_user",
+			Password: "test_password",
+		},
+		Mode: BasicMode,
+		Timeouts: Timeouts{
+			Client:          ClientTimeouts{KeepAlivePeriod: time.Minute},
+			DownstreamProxy: DownstreamProxyTimeouts{DialTimeout: time.Second, KeepAlivePeriod: time.Minute},
+		},
+	}, nil)
+
+	listener, err := p.Listen()
+	require.NoError(t, err)
+	go func() { _ = p.Serve(listener) }()
+	t.Cleanup(func() { require.NoError(t, p.Shutdown(context.Background())) })
+	return listener.Addr().String()
+}
+
+func expectConnectRequest(reader *bufio.Reader) error {
+	req, err := http.ReadRequest(reader)
+	if err != nil {
+		return fmt.Errorf("cannot read CONNECT request: %w", err)
+	}
+	if req.Method != http.MethodConnect {
+		return fmt.Errorf("request method = %s, want CONNECT", req.Method)
+	}
+	if req.Host != "example.com:443" {
+		return fmt.Errorf("CONNECT host = %s, want example.com:443", req.Host)
+	}
+	if authorization := req.Header.Get(HeaderProxyAuthorization); authorization != testProxyAuthorization {
+		return fmt.Errorf("Proxy-Authorization = %q, want Escobar-generated Basic authorization", authorization)
+	}
+	return nil
+}
+
+func requireConnectTestDone(t *testing.T, done <-chan error) {
+	t.Helper()
+
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("downstream CONNECT test timed out")
+	}
 }

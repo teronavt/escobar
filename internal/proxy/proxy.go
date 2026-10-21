@@ -252,97 +252,46 @@ func (p *Proxy) https(rw http.ResponseWriter, req *http.Request) {
 		}
 	}
 
-	p.connectAndCopy(conn, brw, req, false)
+	p.connectAndCopy(conn, brw, req)
 }
 
 // connectAndCopy connects to downstream proxy, authenticates if there is a need and copies traffic between connections
-func (p *Proxy) connectAndCopy(conn net.Conn, brw *bufio.ReadWriter, req *http.Request, reconnected bool) {
+func (p *Proxy) connectAndCopy(conn net.Conn, brw *bufio.ReadWriter, req *http.Request) {
 	logger := req.Context().Value(LogEntryCtx).(*zap.Logger)
 
-	retries := 0
-ProxyDialRetry:
-	// Open connection with downstream proxy
-	pconn, err := net.DialTimeout("tcp", p.config.DownstreamProxyURL.Host, p.config.Timeouts.DownstreamProxy.DialTimeout)
-	if err != nil {
-		if retries < p.config.DownstreamProxyDialRetries {
-			logger.Error("Connection to downstream proxy failed.", zap.Error(err))
-			retries++
-			time.Sleep(1 * time.Second)
-			logger.Debug("Downstream proxy dial retry.", zap.Int("retries", retries))
-
-			goto ProxyDialRetry
-		}
-
-		httpsErrorHijackedHandler(brw, req, fmt.Errorf("cannot connect to downstream proxy: %w", err))
+	// Always replace client-supplied credentials with credentials for the explicitly
+	// configured downstream proxy before the first CONNECT attempt.
+	if err := p.setProxyAuthorizationHeader(req); err != nil {
+		httpsErrorHijackedHandler(brw, req, fmt.Errorf("cannot set authorization header: %w", err))
 		return
 	}
+
+	var pconn net.Conn
+	var pbw *bufio.Writer
+	var pbr *bufio.Reader
 	defer func() {
-		if err := pconn.Close(); err != nil {
-			logger.Error("Cannot close connection", zap.Error(err))
+		if pconn != nil {
+			if err := pconn.Close(); err != nil {
+				logger.Error("Cannot close connection", zap.Error(err))
+			}
 		}
 	}()
 
-	// Set Keep-Alive
-	if tconn, ok := pconn.(*net.TCPConn); ok {
-		if err := tconn.SetKeepAlive(true); err != nil {
-			httpsErrorHijackedHandler(brw, req, fmt.Errorf("cannot turn on keep-alive: %w", err))
-			return
-		}
-		if err := tconn.SetKeepAlivePeriod(p.config.Timeouts.DownstreamProxy.KeepAlivePeriod); err != nil {
-			httpsErrorHijackedHandler(brw, req, fmt.Errorf("cannot set keep-alive period: %w", err))
-			return
-		}
-	}
-
-	// Set Downstream Proxy connection timeouts
-	now := time.Now()
-	if p.config.Timeouts.DownstreamProxy.ReadTimeout.Nanoseconds() != 0 {
-		if err := pconn.SetReadDeadline(now.Add(p.config.Timeouts.DownstreamProxy.ReadTimeout)); err != nil {
-			httpsErrorHijackedHandler(brw, req, fmt.Errorf("cannot set read timeout for connection with downstream proxy: %w", err))
-			return
-		}
-	}
-	if p.config.Timeouts.DownstreamProxy.WriteTimeout.Nanoseconds() != 0 {
-		if err := pconn.SetWriteDeadline(now.Add(p.config.Timeouts.DownstreamProxy.WriteTimeout)); err != nil {
-			httpsErrorHijackedHandler(brw, req, fmt.Errorf("cannot set write timeout for connection with downstream proxy: %w", err))
-			return
-		}
-	}
-
-	pbw := bufio.NewWriter(pconn)
-	pbr := bufio.NewReader(pconn)
-
-	// Write client's request into proxy connection
-	if err := req.Write(pbw); err != nil {
-		httpsErrorHijackedHandler(brw, req, fmt.Errorf("cannot write request into proxy connection: %w", err))
-		return
-	}
-	if err := pbw.Flush(); err != nil {
-		httpsErrorHijackedHandler(brw, req, fmt.Errorf("cannot flush writer to commit request into proxy connection: %w", err))
-		return
-	}
-
-	// Read response from body, usually it's just 407 Proxy Authentication Required
-	resp, err := http.ReadResponse(pbr, req)
-	if err != nil {
-		httpsErrorHijackedHandler(brw, req, fmt.Errorf("cannot read response from proxy connection: %w", err))
-		return
-	}
-
-	switch resp.StatusCode {
-	// Proxy authentication required, we have to pass Proxy-Authorization header
-	case http.StatusProxyAuthRequired:
-		// Close the body, no need to read it, there is only HTML template with Proxy warning
-		//noinspection ALL
-		resp.Body.Close()
-
-		// Set Proxy-Authorization header
-		if err := p.setProxyAuthorizationHeader(req); err != nil {
-			httpsErrorHijackedHandler(brw, req, fmt.Errorf("cannot set authrorization header: %w", err))
-			return
+	// A challenge can require a fresh SPNEGO token, but do not loop forever when
+	// the downstream proxy rejects already-authenticated CONNECT requests.
+	const maxAuthenticationRetries = 1
+	for authenticationRetries := 0; ; {
+		if pconn == nil {
+			var err error
+			pconn, err = p.dialDownstreamProxy(logger)
+			if err != nil {
+				httpsErrorHijackedHandler(brw, req, err)
+				return
+			}
+			pbw = bufio.NewWriter(pconn)
+			pbr = bufio.NewReader(pconn)
 		}
 
-		// Write request into proxy connection again, now with proper auth
 		if err := req.Write(pbw); err != nil {
 			httpsErrorHijackedHandler(brw, req, fmt.Errorf("cannot write request into proxy connection: %w", err))
 			return
@@ -352,54 +301,71 @@ ProxyDialRetry:
 			return
 		}
 
-		// Read proxy response again, hope user credentials are valid and proxy returned 200
-		resp, err = http.ReadResponse(pbr, req)
+		resp, err := http.ReadResponse(pbr, req)
 		if err != nil {
-			// Some proxies drop connection after responding 407
-			var target *net.OpError
-			if (errors.As(err, &target) || errors.Is(err, io.ErrUnexpectedEOF)) && !reconnected {
-				// Reconnection could be tried only once to prevent infinity loop;
-				// Proxy-Authorization header is already set, so we can try again;
-				p.connectAndCopy(conn, brw, req, true)
-				return
-			}
-
 			httpsErrorHijackedHandler(brw, req, fmt.Errorf("cannot read response from proxy connection: %w", err))
 			return
 		}
-		if resp.StatusCode == http.StatusOK {
+
+		switch resp.StatusCode {
+		case http.StatusOK:
+			// A successful CONNECT has no HTTP response body; subsequent bytes are
+			// tunnel data and must remain available to the connection copier.
 			resp.Body = nil
-		} else {
-			logger.Warn("Proxy did NOT return 200 Connection established", zap.Int("proxy_resp_code", resp.StatusCode))
-		}
+			if err := resp.Write(brw); err != nil {
+				httpsErrorHijackedHandler(brw, req, fmt.Errorf("cannot write response from proxy into client connection: %w", err))
+				return
+			}
+			if err := brw.Flush(); err != nil {
+				httpsErrorHijackedHandler(brw, req, fmt.Errorf("cannot flush writer to commit response from proxy into client connection: %w", err))
+				return
+			}
+			goto CopyTunnel
 
-		// Return this response to client
-		if err := resp.Write(brw); err != nil {
-			httpsErrorHijackedHandler(brw, req, fmt.Errorf("cannot write response from proxy into client connection: %w", err))
-			return
-		}
-		if err := brw.Flush(); err != nil {
-			httpsErrorHijackedHandler(brw, req, fmt.Errorf("cannot flush writer to commit response from proxy into client connection: %w", err))
-			return
-		}
-	// 200 Connection established, we can immediately start data transfer
-	case http.StatusOK:
-		// Set body to nil, otherwise we will get deadlock
-		resp.Body = nil
+		case http.StatusProxyAuthRequired:
+			if authenticationRetries >= maxAuthenticationRetries {
+				resp.Body.Close()
+				httpsErrorHijackedHandler(brw, req, fmt.Errorf("downstream proxy rejected authenticated CONNECT request"))
+				return
+			}
 
-		// Return this response to client
-		if err := resp.Write(brw); err != nil {
-			httpsErrorHijackedHandler(brw, req, fmt.Errorf("cannot write response from proxy into client connection: %w", err))
+			// A keep-alive response must be fully consumed before parsing the next
+			// response on this HTTP/1.x connection. Do not drain a connection which
+			// the proxy has explicitly marked for closure.
+			if !resp.Close {
+				if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+					resp.Body.Close()
+					httpsErrorHijackedHandler(brw, req, fmt.Errorf("cannot drain proxy authentication response: %w", err))
+					return
+				}
+			}
+			if err := resp.Body.Close(); err != nil {
+				httpsErrorHijackedHandler(brw, req, fmt.Errorf("cannot close proxy authentication response: %w", err))
+				return
+			}
+
+			if resp.Close {
+				if err := pconn.Close(); err != nil {
+					logger.Error("Cannot close connection", zap.Error(err))
+				}
+				pconn = nil
+			}
+
+			if err := p.setProxyAuthorizationHeader(req); err != nil {
+				httpsErrorHijackedHandler(brw, req, fmt.Errorf("cannot refresh authorization header: %w", err))
+				return
+			}
+			authenticationRetries++
+
+		default:
+			resp.Body.Close()
+			logger.Warn("Proxy did not return 200 Connection Established", zap.Int("proxy_resp_code", resp.StatusCode))
+			httpsErrorHijackedHandler(brw, req, fmt.Errorf("unexpected response from downstream proxy: %s", resp.Status))
 			return
 		}
-		if err := brw.Flush(); err != nil {
-			httpsErrorHijackedHandler(brw, req, fmt.Errorf("cannot flush writer to commit response from proxy into client connection: %w", err))
-			return
-		}
-	default:
-		httpsErrorHijackedHandler(brw, req, fmt.Errorf("unknown code recieved: %d", resp.StatusCode))
-		return
 	}
+
+CopyTunnel:
 
 	// Start traffic copying inside newly created tunnel
 	errc := make(chan error, 1)
@@ -414,7 +380,7 @@ ProxyDialRetry:
 	logger.Debug("CONNECT tunnel opened")
 	defer logger.Debug("CONNECT tunnel closed")
 
-	err = <-errc
+	err := <-errc
 	if err == nil {
 		err = <-errc
 	}
@@ -425,6 +391,52 @@ ProxyDialRetry:
 	}
 
 	logger.Debug("Traffic copied successfully")
+}
+
+func (p *Proxy) dialDownstreamProxy(logger *zap.Logger) (net.Conn, error) {
+	for retries := 0; ; retries++ {
+		pconn, err := net.DialTimeout("tcp", p.config.DownstreamProxyURL.Host, p.config.Timeouts.DownstreamProxy.DialTimeout)
+		if err == nil {
+			if err := p.configureDownstreamProxyConnection(pconn); err != nil {
+				pconn.Close()
+				return nil, err
+			}
+			return pconn, nil
+		}
+
+		if retries >= p.config.DownstreamProxyDialRetries {
+			return nil, fmt.Errorf("cannot connect to downstream proxy: %w", err)
+		}
+
+		logger.Error("Connection to downstream proxy failed.", zap.Error(err))
+		time.Sleep(time.Second)
+		logger.Debug("Downstream proxy dial retry.", zap.Int("retries", retries+1))
+	}
+}
+
+func (p *Proxy) configureDownstreamProxyConnection(pconn net.Conn) error {
+	if tconn, ok := pconn.(*net.TCPConn); ok {
+		if err := tconn.SetKeepAlive(true); err != nil {
+			return fmt.Errorf("cannot turn on keep-alive: %w", err)
+		}
+		if err := tconn.SetKeepAlivePeriod(p.config.Timeouts.DownstreamProxy.KeepAlivePeriod); err != nil {
+			return fmt.Errorf("cannot set keep-alive period: %w", err)
+		}
+	}
+
+	now := time.Now()
+	if p.config.Timeouts.DownstreamProxy.ReadTimeout.Nanoseconds() != 0 {
+		if err := pconn.SetReadDeadline(now.Add(p.config.Timeouts.DownstreamProxy.ReadTimeout)); err != nil {
+			return fmt.Errorf("cannot set read timeout for connection with downstream proxy: %w", err)
+		}
+	}
+	if p.config.Timeouts.DownstreamProxy.WriteTimeout.Nanoseconds() != 0 {
+		if err := pconn.SetWriteDeadline(now.Add(p.config.Timeouts.DownstreamProxy.WriteTimeout)); err != nil {
+			return fmt.Errorf("cannot set write timeout for connection with downstream proxy: %w", err)
+		}
+	}
+
+	return nil
 }
 
 func (p *Proxy) Listen() (net.Listener, error) {
