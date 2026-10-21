@@ -5,7 +5,7 @@
 package proxy
 
 import (
-	"io/ioutil"
+	"io"
 	"net"
 	"testing"
 
@@ -43,7 +43,7 @@ func TestKerberos_Reader(t *testing.T) {
 	r, err := p.config.Kerberos.Reader()
 	require.NoError(t, err)
 
-	raw, err := ioutil.ReadAll(r)
+	raw, err := io.ReadAll(r)
 	require.NoError(t, err)
 
 	actual := string(raw)

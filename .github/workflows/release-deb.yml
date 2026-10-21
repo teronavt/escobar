@@ -16,8 +16,8 @@ jobs:
     name: Go tests
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
@@ -31,8 +31,8 @@ jobs:
     needs: test
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
@@ -42,7 +42,7 @@ jobs:
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
             go build -trimpath -ldflags='-s -w' -o build/escobar ./cmd/escobar
           file build/escobar
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: escobar-linux-amd64
           path: build/escobar
@@ -58,8 +58,8 @@ jobs:
       matrix:
         ubuntu: ['24.04', '26.04', '26.10']
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v7
         with:
           name: escobar-linux-amd64
           path: build
@@ -94,7 +94,7 @@ jobs:
               test -f /usr/lib/systemd/system/escobar@.service
               /usr/bin/escobar --version
             '
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: escobar-deb-ubuntu-${{ matrix.ubuntu }}-amd64
           path: dist/*.deb
@@ -109,7 +109,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           pattern: escobar-deb-ubuntu-*-amd64
           path: release

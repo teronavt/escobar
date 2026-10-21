@@ -11,7 +11,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"net/url"
@@ -105,7 +104,7 @@ Again:
 	//noinspection ALL
 	defer resp.Body.Close()
 
-	if _, err := ioutil.ReadAll(resp.Body); err != nil {
+	if _, err := io.ReadAll(resp.Body); err != nil {
 		return false, fmt.Errorf("cannot read body: %w", err)
 	}
 
