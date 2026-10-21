@@ -36,6 +36,8 @@ escobar --version
 
 ### Сборка из исходного кода
 
+Требуется Go 1.19 или новее.
+
 ```bash
 go build -o escobar ./cmd/escobar
 ./escobar --help
